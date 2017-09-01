@@ -604,6 +604,57 @@ flatpak_get_user_base_dir_location (void)
   return g_object_ref ((GFile *)file);
 }
 
+/* This is a cache directory similar to ~/.cache/flatpak/system-cache,
+ * but in /var/tmp. This is useful for things like the system child
+ * repos, because it is more likely to be on the same filesystem as
+ * the system repo (thus increasing chances for e.g. reflink copying),
+ * and avoids filling the users homedirectory with temporary data.
+ *
+ * In order to re-use this between instances we create a symlink
+ * in /run to it and verify it before use.
+ */
+static GFile *
+flatpak_ensure_system_user_cache_dir_location (GError **error)
+{
+  g_autofree char *path = NULL;
+  g_autofree char *symlink_path = NULL;
+  struct stat st_buf;
+  const char *custom_path = g_getenv ("FLATPAK_SYSTEM_CACHE_DIR");
+
+  if (custom_path != NULL && *custom_path != 0)
+    {
+      if (g_mkdir_with_parents (custom_path, 0755) != 0)
+        {
+          glnx_set_error_from_errno (error);
+          return NULL;
+        }
+
+      return g_file_new_for_path (custom_path);
+    }
+
+  symlink_path = g_build_filename (g_get_user_runtime_dir (), ".flatpak-cache", NULL);
+  path = flatpak_readlink (symlink_path, NULL);
+
+  if (stat (path, &st_buf) == 0 &&
+      /* Must be owned by us */
+      st_buf.st_uid == getuid () &&
+      /* and not writeable by others */
+      (st_buf.st_mode && 0022) != 0)
+    return g_file_new_for_path (path);
+
+  path = g_strdup ("/var/tmp/flatpak-cache-XXXXXX");
+
+  if (g_mkdtemp_full (path, 0755) == NULL)
+    {
+      flatpak_fail (error, "Can't create temporary directory");
+      return NULL;
+    }
+
+  symlink (path, symlink_path);
+
+  return g_file_new_for_path (path);
+}
+
 static GFile *
 flatpak_get_user_cache_dir_location (void)
 {
@@ -2235,6 +2286,7 @@ flatpak_dir_pull_extra_data (FlatpakDir          *self,
   g_autoptr(GVariantBuilder) extra_data_builder = NULL;
   g_autoptr(GVariant) new_detached_metadata = NULL;
   g_autoptr(GVariant) extra_data = NULL;
+  g_autoptr(GFile) base_dir = NULL;
   int i;
   gsize n_extra_data;
   ExtraDataProgress extra_data_progress = { NULL };
@@ -2263,6 +2315,8 @@ flatpak_dir_pull_extra_data (FlatpakDir          *self,
 
   extra_data_progress.progress = progress;
 
+  base_dir = flatpak_get_user_base_dir_location ();
+
   for (i = 0; i < n_extra_data; i++)
     {
       const char *extra_data_uri = NULL;
@@ -2273,6 +2327,7 @@ flatpak_dir_pull_extra_data (FlatpakDir          *self,
       g_autofree char *sha256 = NULL;
       const guchar *sha256_bytes;
       g_autoptr(GBytes) bytes = NULL;
+      g_autoptr(GFile) extra_local_file = NULL;
 
       flatpak_repo_parse_extra_data_sources (extra_data_sources, i,
                                              &extra_data_name,
@@ -2299,10 +2354,30 @@ flatpak_dir_pull_extra_data (FlatpakDir          *self,
 
       /* TODO: Download to disk to support resumed downloads on error */
 
-      ensure_soup_session (self);
-      bytes = flatpak_load_http_uri (self->soup_session, extra_data_uri, NULL, NULL,
-                                     extra_data_progress_report, &extra_data_progress,
-                                     cancellable, error);
+      extra_local_file = flatpak_build_file (base_dir, "extra-data", extra_data_sha256, extra_data_name, NULL);
+      if (g_file_query_exists (extra_local_file, cancellable))
+        {
+          g_debug ("Loading extra-data from local file %s", g_file_get_path (extra_local_file));
+          gsize extra_local_size;
+          g_autofree char *extra_local_contents = NULL;
+          g_autoptr(GError) my_error = NULL;
+
+          if (!g_file_load_contents (extra_local_file, cancellable, &extra_local_contents, &extra_local_size, NULL, &my_error))
+            return flatpak_fail (error, _("Failed to load local extra-data %s: %s"),
+                                 flatpak_file_get_path_cached (extra_local_file), my_error->message);
+          if (extra_local_size != download_size)
+            return flatpak_fail (error, _("Wrong size for extra-data %s"), flatpak_file_get_path_cached (extra_local_file));
+
+          bytes = g_bytes_new (extra_local_contents, extra_local_size);
+        }
+      else
+        {
+          ensure_soup_session (self);
+          bytes = flatpak_load_http_uri (self->soup_session, extra_data_uri, NULL, NULL,
+                                         extra_data_progress_report, &extra_data_progress,
+                                         cancellable, error);
+        }
+
       if (bytes == NULL)
         {
           reset_async_progress_extra_data (progress);
@@ -5304,7 +5379,7 @@ flatpak_dir_create_system_child_oci_registry (FlatpakDir   *self,
   if (!flatpak_dir_ensure_repo (self, NULL, error))
     return NULL;
 
-  cache_dir = flatpak_ensure_user_cache_dir_location (error);
+  cache_dir = flatpak_ensure_system_user_cache_dir_location (error);
   if (cache_dir == NULL)
     return NULL;
 
@@ -5346,13 +5421,17 @@ flatpak_dir_create_system_child_repo (FlatpakDir   *self,
   const char *mode_str = "bare-user";
   g_autofree char *current_mode = NULL;
   const char *mode_env = g_getenv ("FLATPAK_OSTREE_REPO_MODE");
+  GKeyFile *orig_config = NULL;
+  g_autofree char *orig_min_free_space_percent = NULL;
 
   g_assert (!self->user);
 
   if (!flatpak_dir_ensure_repo (self, NULL, error))
     return NULL;
 
-  cache_dir = flatpak_ensure_user_cache_dir_location (error);
+  orig_config = ostree_repo_get_config (self->repo);
+
+  cache_dir = flatpak_ensure_system_user_cache_dir_location (error);
   if (cache_dir == NULL)
     return NULL;
 
@@ -5416,6 +5495,11 @@ flatpak_dir_create_system_child_repo (FlatpakDir   *self,
   /* Ensure the config is updated */
   g_key_file_set_string (config, "core", "parent",
                          flatpak_file_get_path_cached (ostree_repo_get_path (self->repo)));
+
+  /* Copy the min space percent value so it affects the temporary repo too */
+  orig_min_free_space_percent = g_key_file_get_value (orig_config, "core", "min-free-space-percent", NULL);
+  if (orig_min_free_space_percent)
+    g_key_file_set_value (config, "core", "min-free-space-percent", orig_min_free_space_percent);
 
   if (!ostree_repo_write_config (new_repo, config, error))
     return NULL;
@@ -8023,6 +8107,7 @@ flatpak_dir_create_origin_remote (FlatpakDir   *self,
 GKeyFile *
 flatpak_dir_parse_repofile (FlatpakDir   *self,
                             const char   *remote_name,
+                            gboolean      from_ref,
                             GBytes       *data,
                             GBytes      **gpg_data_out,
                             GCancellable *cancellable,
@@ -8037,6 +8122,13 @@ flatpak_dir_parse_repofile (FlatpakDir   *self,
   g_autofree char *collection_id = NULL;
   g_autofree char *default_branch = NULL;
   gboolean nodeps;
+  const char *source_group;
+
+  if (from_ref)
+    source_group = FLATPAK_REF_GROUP;
+  else
+    source_group = FLATPAK_REPO_GROUP;
+
   GKeyFile *config = g_key_file_new ();
   g_autofree char *group = g_strdup_printf ("remote \"%s\"", remote_name);
 
@@ -8049,13 +8141,13 @@ flatpak_dir_parse_repofile (FlatpakDir   *self,
       return NULL;
     }
 
-  if (!g_key_file_has_group (keyfile, FLATPAK_REPO_GROUP))
+  if (!g_key_file_has_group (keyfile, source_group))
     {
       flatpak_fail (error, "Invalid .flatpakref\n");
       return NULL;
     }
 
-  uri = g_key_file_get_string (keyfile, FLATPAK_REPO_GROUP,
+  uri = g_key_file_get_string (keyfile, source_group,
                                FLATPAK_REPO_URL_KEY, NULL);
   if (uri == NULL)
     {
@@ -8065,22 +8157,22 @@ flatpak_dir_parse_repofile (FlatpakDir   *self,
 
   g_key_file_set_string (config, group, "url", uri);
 
-  title = g_key_file_get_locale_string (keyfile, FLATPAK_REPO_GROUP,
+  title = g_key_file_get_locale_string (keyfile, source_group,
                                         FLATPAK_REPO_TITLE_KEY, NULL, NULL);
   if (title != NULL)
     g_key_file_set_string (config, group, "xa.title", title);
 
-  default_branch = g_key_file_get_locale_string (keyfile, FLATPAK_REPO_GROUP,
+  default_branch = g_key_file_get_locale_string (keyfile, source_group,
                                                  FLATPAK_REPO_DEFAULT_BRANCH_KEY, NULL, NULL);
   if (default_branch != NULL)
     g_key_file_set_string (config, group, "xa.default-branch", default_branch);
 
-  nodeps = g_key_file_get_boolean (keyfile, FLATPAK_REPO_GROUP,
+  nodeps = g_key_file_get_boolean (keyfile, source_group,
                                    FLATPAK_REPO_NODEPS_KEY, NULL);
   if (nodeps)
     g_key_file_set_boolean (config, group, "xa.nodeps", TRUE);
 
-  gpg_key = g_key_file_get_string (keyfile, FLATPAK_REPO_GROUP,
+  gpg_key = g_key_file_get_string (keyfile, source_group,
                                    FLATPAK_REPO_GPGKEY_KEY, NULL);
   if (gpg_key != NULL)
     {
@@ -8100,7 +8192,7 @@ flatpak_dir_parse_repofile (FlatpakDir   *self,
     }
 
 #ifdef FLATPAK_ENABLE_P2P
-  collection_id = g_key_file_get_string (keyfile, FLATPAK_REPO_GROUP,
+  collection_id = g_key_file_get_string (keyfile, source_group,
                                          FLATPAK_REPO_COLLECTION_ID_KEY, NULL);
 #else  /* if !FLATPAK_ENABLE_P2P */
   collection_id = NULL;
@@ -9666,25 +9758,21 @@ flatpak_dir_find_local_related (FlatpakDir *self,
 static GDBusProxy *
 get_accounts_dbus_proxy (void)
 {
-  GDBusConnection *conn = NULL;
-  GDBusProxy *proxy = NULL;
+  g_autoptr(GDBusConnection) conn = NULL;
 
   const char *accounts_bus_name = "org.freedesktop.Accounts";
   const char *accounts_object_path = "/org/freedesktop/Accounts";
   const char *accounts_interface_name = accounts_bus_name;
 
   conn = g_bus_get_sync (G_BUS_TYPE_SYSTEM, NULL, NULL);
-  proxy = g_dbus_proxy_new_for_bus_sync (G_BUS_TYPE_SYSTEM,
-                                         G_DBUS_PROXY_FLAGS_NONE,
-                                         NULL,
-                                         accounts_bus_name,
-                                         accounts_object_path,
-                                         accounts_interface_name,
-                                         NULL,
-                                         NULL);
-  g_object_unref (conn);
-
-  return proxy;
+  return g_dbus_proxy_new_for_bus_sync (G_BUS_TYPE_SYSTEM,
+                                        G_DBUS_PROXY_FLAGS_NONE,
+                                        NULL,
+                                        accounts_bus_name,
+                                        accounts_object_path,
+                                        accounts_interface_name,
+                                        NULL,
+                                        NULL);
 }
 
 static char **
@@ -9695,12 +9783,12 @@ get_locale_subpaths_from_accounts_dbus (GDBusProxy *proxy)
   char **object_path;
   GList *langs = NULL;
   GList *l = NULL;
-  GString *langs_cache = g_string_new(NULL);
-  GPtrArray *subpaths = g_ptr_array_new ();
+  g_autoptr(GString) langs_cache = g_string_new (NULL);
+  g_autoptr(GPtrArray) subpaths = g_ptr_array_new ();
   gboolean use_full_language = FALSE;
   int i;
+  g_autoptr(GVariant) ret = NULL;
 
-  GVariant *ret;
   ret = g_dbus_proxy_call_sync (G_DBUS_PROXY (proxy),
                                 "ListCachedUsers",
                                 g_variant_new ("()"),
@@ -9709,21 +9797,16 @@ get_locale_subpaths_from_accounts_dbus (GDBusProxy *proxy)
                                 NULL,
                                 NULL);
   if (ret != NULL)
-    {
-      g_variant_get (ret,
-                     "(^ao)",
-                     &object_path);
-      g_variant_unref (ret);
-    }
+    g_variant_get (ret,
+                   "(^ao)",
+                   &object_path);
 
   if (object_path != NULL)
     {
       for (i = 0; object_path[i] != NULL; i++)
         {
-          GDBusProxy *accounts_proxy = NULL;
-          GVariant *value = NULL;
-          gsize size;
-          char *lang;
+          g_autoptr(GDBusProxy) accounts_proxy = NULL;
+          g_autoptr(GVariant) value = NULL;
 
           accounts_proxy = g_dbus_proxy_new_for_bus_sync (G_BUS_TYPE_SYSTEM,
                                                           G_DBUS_PROXY_FLAGS_NONE,
@@ -9734,21 +9817,16 @@ get_locale_subpaths_from_accounts_dbus (GDBusProxy *proxy)
                                                           NULL,
                                                           NULL);
 
-          value = g_dbus_proxy_get_cached_property (accounts_proxy, "Language");
-          if (value != NULL)
+          if (accounts_proxy)
             {
-              size = g_variant_get_size (value);
-              lang = g_strdup (g_variant_get_string (value, &size));
-              langs = g_list_append (langs, lang);
-
-              g_variant_unref (value);
-              g_object_unref (accounts_proxy);
+              value = g_dbus_proxy_get_cached_property (accounts_proxy, "Language");
+              if (value != NULL)
+                langs = g_list_append (langs, g_variant_dup_string (value, NULL));
             }
         }
   }
 
-  l = langs;
-  while (l != NULL)
+  for (l = langs; l != NULL; l = l->next)
     {
       g_autofree char *dir = g_strconcat ("/", l->data, NULL);
       char *c;
@@ -9780,35 +9858,19 @@ get_locale_subpaths_from_accounts_dbus (GDBusProxy *proxy)
           g_string_append_c (langs_cache, ':');
           g_ptr_array_add (subpaths, g_steal_pointer (&dir));
         }
-
-      l = l->next;
     }
 
   if (langs == NULL)
-    {
-      return NULL;
-    }
+    return NULL;
 
-  l = langs;
-  while (l != NULL)
-    {
-      if (l->data != NULL)
-        g_free (l->data);
-      l = l->next;
-    }
-  g_list_free (langs);
-
-  g_string_free(langs_cache, TRUE);
+  g_list_free_full (langs, g_free);
 
   g_ptr_array_add (subpaths, NULL);
 
   if (use_full_language)
-    {
-      g_ptr_array_free (subpaths, TRUE);
-      return NULL;
-    }
+    return NULL;
   else
-    return (char **)g_ptr_array_free (subpaths, FALSE);
+    return (char **)g_ptr_array_free (g_steal_pointer (&subpaths), FALSE);
 }
 
 char **
@@ -9828,17 +9890,12 @@ flatpak_dir_get_locale_subpaths (FlatpakDir *self)
         {
           /* If proxy is not NULL, it means that AccountService exists
            * and gets the list of languages from AccountService. */
-          GDBusProxy *proxy = get_accounts_dbus_proxy ();
+          g_autoptr(GDBusProxy) proxy = get_accounts_dbus_proxy ();
           if (proxy != NULL)
-            {
-              subpaths = get_locale_subpaths_from_accounts_dbus (proxy);
-              g_object_unref (proxy);
+            subpaths = get_locale_subpaths_from_accounts_dbus (proxy);
 
-              /* If subpaths is NULL, it means using all languages */
-              if (subpaths == NULL)
-                subpaths = g_new0 (char *, 1);
-            }
-          else /* proxy is NULL, falling back to all languages */
+          /* If subpaths is NULL, it means using all languages */
+          if (subpaths == NULL)
             subpaths = g_new0 (char *, 1);
         }
     }
